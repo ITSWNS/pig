@@ -18,12 +18,34 @@ func main() {
     where := pflag.String("where", "", "Optional WHERE clause")
     version := pflag.Bool("version", false, "Print version and exit")
     verbose := pflag.Bool("verbose", false, "Enable verbose output")
+    dryRun := pflag.Bool("dry-run", false, "Simulate actions without making changes")
+    force := pflag.Bool("force", false, "Force upsert of all rows from source into target, ignoring differences")
+    help := pflag.Bool("help", false, "Display usage information")
 
     pflag.Parse()
 
+    if *help {
+        fmt.Println("Usage: pig --source=<connection_string> --target=<connection_string> --table=<table_name> [OPTIONS]")
+        pflag.PrintDefaults()
+        os.Exit(0)
+    }
+
+    if *source == "" {
+        *source = os.Getenv("PIG_SOURCE")
+    }
+    if *target == "" {
+        *target = os.Getenv("PIG_TARGET")
+    }
+
     if *version {
-        fmt.Println("🐷 pig version 0.1.13")
+        fmt.Println("🐷 pig version 0.1.21")
         return
+    }
+
+    if *source == "" || *target == "" || *table == "" {
+        fmt.Println("Error: --source, --target, and --table are required.")
+        pflag.Usage()
+        os.Exit(1)
     }
 
     logger := log.New(os.Stdout, "", log.LstdFlags)
@@ -41,13 +63,19 @@ func main() {
     }
     defer targetConn.Close(ctx)
 
-    err = makeTableSame(ctx, sourceConn, targetConn, *table, *where, *verbose, logger)
+    err = makeTableSame(ctx, sourceConn, targetConn, *table, *where, *verbose, *dryRun, *force, logger)
     if err != nil {
         logger.Fatal(err)
     }
+
+    if *dryRun {
+        logger.Println("Dry-run completed! No changes made to the target. 🐷")
+    } else {
+        logger.Println("Synchronization completed successfully. 🐷 ")
+    }
 }
 
-func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where string, verbose bool, logger *log.Logger) error {
+func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where string, verbose, dryRun, force bool, logger *log.Logger) error {
     schema, tableName := splitSchemaTable(table)
 
     pkCols, err := getPrimaryKeyColumns(ctx, source, schema, tableName)
@@ -67,10 +95,21 @@ func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where s
         return fmt.Errorf("error getting column names: %w", err)
     }
 
-    pkColsStr := joinIdentifiers(pkCols)
-    selectCols := joinIdentifiers(colNames)
+    skipColumns := map[string]bool{"search_vector": true}
+    filteredColNames := make([]string, 0, len(colNames))
+    for _, col := range colNames {
+        if !skipColumns[col] {
+            filteredColNames = append(filteredColNames, col)
+        }
+    }
 
-    // Source query with WHERE clause
+    if verbose && len(filteredColNames) != len(colNames) {
+        logger.Printf("Excluded columns: %v", colNames[len(filteredColNames):])
+    }
+
+    pkColsStr := joinIdentifiers(pkCols)
+    selectCols := joinIdentifiers(filteredColNames)
+
     sourceQuery := fmt.Sprintf(
         "SELECT %s, md5(row_to_json(t)::text) AS row_hash FROM %s.%s t",
         pkColsStr, quoteIdentifier(schema), quoteIdentifier(tableName),
@@ -83,7 +122,6 @@ func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where s
         logger.Printf("Source query: %s", sourceQuery)
     }
 
-    // Fetch rows from source
     sourceRows, err := source.Query(ctx, sourceQuery)
     if err != nil {
         return fmt.Errorf("error querying source: %w", err)
@@ -115,7 +153,6 @@ func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where s
         logger.Printf("Fetched %d rows from source", len(sourceData))
     }
 
-    // Fetch target rows matching the primary keys from sourceData
     targetKeys := make([]string, 0, len(sourceData))
     for key := range sourceData {
         targetKeys = append(targetKeys, key)
@@ -128,7 +165,6 @@ func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where s
         return nil
     }
 
-    // Build IN clause for target query
     pkPlaceholders := make([]string, len(pkCols))
     for i := range pkCols {
         pkPlaceholders[i] = fmt.Sprintf("%s = ANY($1)", quoteIdentifier(pkCols[i]))
@@ -144,19 +180,16 @@ func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where s
         logger.Printf("Target query: %s", targetQuery)
     }
 
-    // Convert targetKeys to slice of primary key values
     targetPKValues := make([][]interface{}, len(targetKeys))
     for i, key := range targetKeys {
         targetPKValues[i] = splitKey(key)
     }
 
-    // Flatten targetPKValues for query argument
     var args []interface{}
     for _, pkValues := range targetPKValues {
-        args = append(args, pkValues[0]) // Assuming single-column primary key
+        args = append(args, pkValues[0])
     }
 
-    // Fetch rows from target
     targetRows, err := target.Query(ctx, targetQuery, args)
     if err != nil {
         return fmt.Errorf("error querying target: %w", err)
@@ -203,35 +236,46 @@ func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where s
         return fmt.Errorf("error deferring constraints on target: %w", err)
     }
 
-    // Identify rows to update/insert
     keysToUpsert := make([]string, 0)
+    keysToInsert := make([]string, 0)
+    keysToDelete := make([]string, 0)
 
     for key, sourceHash := range sourceData {
         targetHash, exists := targetData[key]
-        if !exists || sourceHash != targetHash {
+        if !exists {
+            keysToInsert = append(keysToInsert, key)
+        } else if force || sourceHash != targetHash {
             keysToUpsert = append(keysToUpsert, key)
         }
     }
 
-    if verbose {
-        logger.Printf("Rows to upsert: %d", len(keysToUpsert))
+    // Identify rows to delete (those present in target but missing in source)
+    for key := range targetData {
+        if _, exists := sourceData[key]; !exists {
+            keysToDelete = append(keysToDelete, key)
+        }
     }
 
-    // Prepare upsert statement
-    placeholders := make([]string, len(colNames))
+    if verbose {
+        logger.Printf("Rows to insert: %d", len(keysToInsert))
+        logger.Printf("Rows to upsert: %d", len(keysToUpsert))
+        logger.Printf("Rows to delete: %d", len(keysToDelete))
+    }
+
+    placeholders := make([]string, len(filteredColNames))
     for i := range placeholders {
         placeholders[i] = fmt.Sprintf("$%d", i+1)
     }
 
-    updateSet := make([]string, len(colNames))
-    for i, col := range colNames {
+    updateSet := make([]string, len(filteredColNames))
+    for i, col := range filteredColNames {
         updateSet[i] = fmt.Sprintf("%s = EXCLUDED.%s", quoteIdentifier(col), quoteIdentifier(col))
     }
 
     upsertQuery := fmt.Sprintf(
         "INSERT INTO %s.%s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s",
         quoteIdentifier(schema), quoteIdentifier(tableName),
-        joinIdentifiers(colNames),
+        joinIdentifiers(filteredColNames),
         strings.Join(placeholders, ", "),
         pkColsStr,
         strings.Join(updateSet, ", "),
@@ -241,7 +285,7 @@ func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where s
         logger.Printf("Upsert query: %s", upsertQuery)
     }
 
-    for _, key := range keysToUpsert {
+    for _, key := range append(keysToInsert, keysToUpsert...) {
         pkValues := splitKey(key)
         selectQuery := fmt.Sprintf(
             "SELECT %s FROM %s.%s WHERE %s",
@@ -249,8 +293,8 @@ func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where s
         )
         sourceRow := source.QueryRow(ctx, selectQuery, pkValues...)
 
-        columns := make([]interface{}, len(colNames))
-        columnPointers := make([]interface{}, len(colNames))
+        columns := make([]interface{}, len(filteredColNames))
+        columnPointers := make([]interface{}, len(filteredColNames))
         for i := range columns {
             columnPointers[i] = &columns[i]
         }
@@ -266,13 +310,35 @@ func makeTableSame(ctx context.Context, source, target *pgx.Conn, table, where s
         }
     }
 
-    err = tx.Commit(ctx)
-    if err != nil {
-        return fmt.Errorf("error committing transaction: %w", err)
+    deleteQuery := fmt.Sprintf(
+        "DELETE FROM %s.%s WHERE %s",
+        quoteIdentifier(schema), quoteIdentifier(tableName), buildWhereClause(pkCols),
+    )
+
+    for _, key := range keysToDelete {
+        pkValues := splitKey(key)
+        _, err = tx.Exec(ctx, deleteQuery, pkValues...)
+        if err != nil {
+            return fmt.Errorf("error deleting row from target: %w", err)
+        }
     }
 
-    if verbose {
-        logger.Println("Synchronization completed successfully. 🐷 ")
+    if dryRun {
+        err = tx.Rollback(ctx)
+        if err != nil {
+            return fmt.Errorf("error rolling back transaction: %w", err)
+        }
+        if verbose {
+            logger.Println("Dry-run mode: transaction rolled back.")
+        }
+    } else {
+        err = tx.Commit(ctx)
+        if err != nil {
+            return fmt.Errorf("error committing transaction: %w", err)
+        }
+        if verbose {
+            logger.Println("Saved changes.")
+        }
     }
 
     return nil
